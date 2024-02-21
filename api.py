@@ -1,4 +1,5 @@
 import enum
+import re
 import itertools
 import requests
 from datetime import datetime
@@ -11,35 +12,60 @@ class Degree(enum.Enum):
 
 
 class Course:
-    def __init__(self, code: str, schedule: list) -> None:
+    def __init__(self, code: str, schedule: list=[]) -> None:
         self.code = code
         self.schedule = schedule
+        
 
     def set_name(self, name):
         self.name = name
+    
+    def set_schedule(self, schedule: list):
+        self.schedule = schedule
+    
+    def set_max_seats(self, n:int):
+        self.max_seats = n
+    
+    def set_occupied_seats(self, n:int):
+        self.occupied_seats = n
+    
+    def set_campus(self, campus:str):
+        self.campus = campus
+    
+    def set_id(self, id:str):
+        self.id = id
+
 
 
 class User:
     def __init__(self, cookie: str = "") -> None:
         self.cookie = {"XK_TOKEN": cookie}
         self.degree = Degree.MS
+        self.courses = []
         if cookie:
             self.load()
-        else:
-            self.courses = []
+
+    def set_check_available(self, flag:bool):
+            self.check_available = flag
+            
 
     def load(self):
         # TODO implement loading schemes for other degrees
         if self.degree == Degree.MS:
-            routes = ["http://yjsxk.sjtu.edu.cn/yjsxkapp/sys/wdpyjhapp/modules/wdpyjh/wdxx.do",
+            self.routes = ["http://yjsxk.sjtu.edu.cn/yjsxkapp/sys/wdpyjhapp/modules/wdpyjh/wdxx.do",
                       "http://yjsxk.sjtu.edu.cn/yjsxkapp/sys/wdpyjhapp/modules/wdpyjh/wdkclbtj.do",
                       "http://yjsxk.sjtu.edu.cn/yjsxkapp/sys/wdpyjhapp/modules/wdpyjh/wdkcxx.do",
-                      "http://yjsxk.sjtu.edu.cn/yjsxkapp/sys/xsxkapp/xsxkHome/loadPublicInfo_index.do"]
+                      "http://yjsxk.sjtu.edu.cn/yjsxkapp/sys/xsxkapp/xsxkHome/loadPublicInfo_index.do",
+                      "http://yjsxk.sjtu.edu.cn/yjsxkapp/sys/xsxkapp/xsxkHome/loadPublicInfo_course.do",
+                      "http://yjsxk.sjtu.edu.cn/yjsxkapp/sys/xsxkapp/xsxkCourse/loadJhnCourseInfo.do",
+                      "http://yjsxk.sjtu.edu.cn/yjsxkapp/sys/xsxkapp/xsxkCourse/choiceCourse.do"]
             try:
-                r1 = requests.get(routes[0], cookies=self.cookie).json()
-                r2 = requests.get(routes[1], cookies=self.cookie).json()
-                r3 = requests.get(routes[2], cookies=self.cookie).json()
-                r4 = requests.get(routes[3], cookies=self.cookie).json()
+                r1 = requests.get(self.routes[0], cookies=self.cookie).json()
+                r2 = requests.get(self.routes[1], cookies=self.cookie).json()
+                r3 = requests.get(self.routes[2], cookies=self.cookie).json()
+                r4 = requests.get(self.routes[3], cookies=self.cookie).json()
+                r5 = requests.get(self.routes[4], cookies=self.cookie).json()
+                r6 = requests.post(self.routes[5], cookies=self.cookie, data={"pageSize":10, "pageIndex":1}).json()
             except Exception:
                 raise Exception("Token is broken, please use a new one")
 
@@ -58,15 +84,63 @@ class User:
                 course = Course(obj['KCDM'])
                 course.set_name(obj['KCMC'])
                 self.training_plan.append(course)
-            # TODO init selectable courses from REST api
-            self.courses = []
+            # this token is used to select courses
+            self._csrf_token = r5['csrfToken']
+            self.schedule_regex = r".\[\d+-\d+.\]"
+            self.session_regex = r"[0-9]{1,}"
+            self.schedule_extractor = re.compile(self.schedule_regex)
+            self.session_extractor = re.compile(self.session_regex)
+            self.day_map = {"一":0,"二":1,"三":2,"四":3,"五":4,"六":5, "七": 6}
+            # get the selectable courses within the training plan
+            for data in r6['datas']:
+                schedule = []
+                course = Course(data['BJMC'])
+                course.set_name(data['KCDM'])
+                course.set_campus(data['XQYWMC'])
+                course.set_occupied_seats(data['DQRS'])
+                course.set_max_seats(data['KXRS'])
+                course.set_id(data['BJDM'])
+                schedule_str = data.get('PKSJDD','')
+                # if there is schedule, otherwise just add the course without schedule
+                if schedule_str:
+                    schedule_str.replace(" ", "")
+                    schedule_str_array = self.schedule_extractor.findall(schedule_str)
+                    for entry in schedule_str_array:
+                        day = entry[0]
+                        sessions = self.session_extractor.findall(entry)
+                        start_session = self.day_map[day]*15 + int(sessions[0])
+                        end_session = self.day_map[day]*15 + int(sessions[1])
+                        schedule.append((start_session, end_session))
+                    course.set_schedule(schedule)
+                self.courses.append(course)
+                
+    def select(self, course: Course):
+        url = self.routes[6]
+        response = requests.post(url, cookies=self.cookie,data={"bjdm": course.id, "lx":0, "csrfToken":self._csrf_token})
+        return response
+
 
     def _sublists(self, lst):
+        """Generate all possible and impossible combinations of courses taking into account that one course
+        can have multiple instances
+        """
+        final = []
         temp = []
         for L in range(len(lst) + 1):
             for subset in itertools.combinations(lst, L):
                 temp.append(list(subset))
-        return temp
+        # remove all configurations where there is a repeated course with the same name
+        for configuration in temp:
+            l = len(configuration)
+            flag = False
+            for i in range(l):
+                for j in range(i+1,l):
+                    if configuration[i].name == configuration[j].name:
+                        flag = True
+                        break
+            if not flag:
+                final.append(configuration)
+        return final
 
     def _is_overlap(self, task_1: list, task_2: list):
         """check if there is overal between two tasks with any number of intervals
@@ -78,9 +152,9 @@ class User:
                     flag = True
         return flag
 
-    def _find_non_overlapping_configurations(self):
-        # self.courses is a list of Course objects
-        configurations = self._sublists(self.courses)
+    def _find_non_overlapping_configurations(self, courses:list):
+        # courses is a list of Course objects
+        configurations = self._sublists(courses)
         temp = []
         for configuration in configurations:
             n = len(configuration)
@@ -101,7 +175,11 @@ class User:
         """ Basic implementation of interval scheduling
         where each task has n >= 1 mutually exclusive intervals, time complexity O(2^n), use with caution
         """
-        tasks = self._find_non_overlapping_configurations()
+        # remove courses which don't have scedule
+        self.remove_unscheduled_courses()
+        # check what courses have open slots
+        selectable = self.get_selectable_courses()
+        tasks = self._find_non_overlapping_configurations(selectable)
         tasks.pop(0)
         temp = []
         max_len = len(max(tasks, key=lambda x: len(x)))
@@ -110,11 +188,32 @@ class User:
                 temp.append(x)
         return temp
 
+    def print_courses(self):
+        for course in self.courses:
+            print(course.code, course.schedule, f"{course.occupied_seats}/{course.max_seats}")
+    
+    def get_unique_course_names(self):
+        return set([course.name for course in self.courses])
+
+    def get_selectable_courses(self):
+        temp = []
+        for course in self.courses:
+            if course.max_seats - course.occupied_seats > 0:
+                temp.append(course)
+        return temp
+
+    def remove_unscheduled_courses(self):
+        temp = []
+        for course in self.courses:
+            if course.schedule:
+                temp.append(course)
+        self.courses = temp
+
 
 if __name__ == "__main__":
-    a = Course('1', [(3, 5), (7, 9)])
-    b = Course('2', [(0, 1), (5, 7)])
-    c = Course('3', [(2, 3), (9, 10)])
+    a = Course('Course 1', [(3, 4), (7, 9)])
+    b = Course('Course 2', [(2, 2), (5, 6)])
+    c = Course('Course 3', [(2, 3), (9, 10)])
     user = User()
     user.courses.append(a)
     user.courses.append(b)
